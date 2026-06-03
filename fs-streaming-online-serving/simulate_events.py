@@ -1,26 +1,25 @@
 """
 Streaming Recommendation Demo — Event Simulator
 ================================================
-Simulates realistic user browsing behavior and continuously inserts
-events into ML_DEMOS.ONLINE_W_STREAMING.RAW_EVENTS.
+Simulates realistic user browsing behavior and continuously sends
+events to the Feature Store online service ingest API.
 
 Behavior:
-  - Seeds USERS and ITEMS tables on first run if empty.
+  - Generates users and items in-memory (no database connection needed).
   - Maintains a pool of concurrent active sessions (default 15).
   - Each session follows a realistic flow:
       land → view sequence → maybe add-to-cart → maybe purchase → end
   - Dwell time drawn from a log-normal distribution (median ~15s).
   - Item bursts: every 60–90s, 1–2 items trend and get 5–10x more traffic.
-  - Inserts in micro-batches every ~1.5s to simulate a live stream.
+  - Sends events in micro-batches every ~1.5s via the ingest API.
 
 Usage:
-  pip install snowflake-connector-python faker
+  pip install requests
   python simulate_events.py
 
-Connection: reads from env vars:
-  SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, SNOWFLAKE_PASSWORD (or SNOWFLAKE_PRIVATE_KEY_PATH)
-  Optional: SNOWFLAKE_WAREHOUSE, SNOWFLAKE_ROLE
-  Or edit the CONNECTION dict below directly.
+Env vars:
+  INGEST_URL    — base URL of the online service (e.g. http://<host>:8080)
+  SNOWFLAKE_PAT — Snowflake personal access token for the ingest API
 """
 
 import os
@@ -34,21 +33,14 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Optional
 
-import snowflake.connector
+import requests
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-CONNECTION = {
-    "account":   os.getenv("SNOWFLAKE_ACCOUNT", ""),
-    "user":      os.getenv("SNOWFLAKE_USER", ""),
-    "password":  os.getenv("SNOWFLAKE_PASSWORD", ""),
-    "warehouse": os.getenv("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH"),
-    "role":      os.getenv("SNOWFLAKE_ROLE", ""),
-    "database":  "ML_DEMOS",
-    "schema":    "ONLINE_W_STREAMING",
-}
+INGEST_URL   = os.getenv("INGEST_URL", "http://fs-runtime-164092676.f6yc.svc.spcs.internal:8080")
+SNOWFLAKE_PAT = os.getenv("SNOWFLAKE_PAT", "")
 
 BATCH_INTERVAL_SEC    = 1.5    # seconds between inserts
 BATCH_SIZE            = 12     # events per insert batch
@@ -78,9 +70,9 @@ BRANDS = [
     "Elevate", "ProPulse", "NovaSport", "ZenAthletics", "FieldEdge",
 ]
 
-COUNTRIES = ["US", "US", "US", "US", "CA", "UK", "AU", "DE", "FR", "JP"]
-SEGMENTS  = ["new", "new", "returning", "returning", "returning", "vip"]
-DEVICES   = ["mobile", "mobile", "desktop", "desktop", "tablet"]
+COUNTRIES  = ["US", "US", "US", "US", "CA", "UK", "AU", "DE", "FR", "JP"]
+SEGMENTS   = ["new", "new", "returning", "returning", "returning", "vip"]
+DEVICES    = ["mobile", "mobile", "desktop", "desktop", "tablet"]
 AGE_GROUPS = ["18-24", "25-34", "35-44", "45-54", "55+"]
 
 NUM_USERS = 200
@@ -123,7 +115,7 @@ def _rand_dwell() -> int:
 
 
 def _weighted_choice(options: dict) -> str:
-    keys   = list(options.keys())
+    keys    = list(options.keys())
     weights = list(options.values())
     return random.choices(keys, weights=weights, k=1)[0]
 
@@ -138,13 +130,11 @@ def _now_utc() -> datetime:
 
 def generate_users() -> list[dict]:
     users = []
-    base_ts = datetime(2020, 1, 1)
     for i in range(NUM_USERS):
-        days_ago = random.randint(0, 1825)
-        signup = base_ts.replace(
+        signup = datetime(
+            year=random.randint(2020, 2025),
             month=random.randint(1, 12),
             day=random.randint(1, 28),
-            year=random.randint(2020, 2025),
         )
         users.append({
             "user_id":      f"U{i+1:05d}",
@@ -164,7 +154,6 @@ def generate_items() -> list[dict]:
     for category, subcats in CATEGORIES.items():
         for _ in range(per_category):
             subcat = random.choice(subcats)
-            # Price ranges vary by category
             base_price = {"Cycling": 300, "Camping": 80, "Running": 120}.get(category, 40)
             price = round(base_price * random.uniform(0.5, 4.0), 2)
             items.append({
@@ -179,6 +168,9 @@ def generate_items() -> list[dict]:
             })
             idx += 1
     return items
+
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -205,15 +197,13 @@ class Session:
 
 class TrendingManager:
     def __init__(self, all_item_ids: list[str]):
-        self.all_items   = all_item_ids
-        self.trending    : dict[str, float] = {}  # item_id -> expiry timestamp
-        self.next_burst  = time.time() + random.uniform(BURST_INTERVAL_MIN, BURST_INTERVAL_MAX)
+        self.all_items  = all_item_ids
+        self.trending   : dict[str, float] = {}  # item_id -> expiry timestamp
+        self.next_burst = time.time() + random.uniform(BURST_INTERVAL_MIN, BURST_INTERVAL_MAX)
 
     def tick(self):
         now = time.time()
-        # Expire old trending items
         self.trending = {k: v for k, v in self.trending.items() if v > now}
-        # Maybe start a new burst
         if now >= self.next_burst:
             new_items = random.sample(self.all_items, k=random.randint(1, 2))
             expiry = now + BURST_DURATION_SEC
@@ -229,11 +219,8 @@ class TrendingManager:
             pool = self.all_items
 
         if self.trending and random.random() < 0.3:
-            # 30% chance to pick a trending item (regardless of category)
-            candidates = list(self.trending.keys())
-            return random.choice(candidates)
+            return random.choice(list(self.trending.keys()))
 
-        # Weighted draw: trending items get BURST_MULTIPLIER weight, others get 1
         weights = [BURST_MULTIPLIER if i in self.trending else 1 for i in pool]
         return random.choices(pool, weights=weights, k=1)[0]
 
@@ -264,25 +251,24 @@ def generate_event(
 
     now = _now_utc()
     event = {
-        "event_id":          str(uuid.uuid4()),
-        "session_id":        session.session_id,
-        "user_id":           session.user_id,
-        "item_id":           None,
-        "event_type":        next_state,
-        "event_ts":          now.strftime("%Y-%m-%d %H:%M:%S.%f"),
-        "dwell_time_sec":    None,
-        "search_query":      None,
-        "referrer_item_id":  None,
-        "properties":        json.dumps({
-            "device":   user["device_type"],
-            "country":  user["country"],
+        "EVENT_ID":         str(uuid.uuid4()),
+        "SESSION_ID":       session.session_id,
+        "USER_ID":          session.user_id,
+        "ITEM_ID":          None,
+        "EVENT_TYPE":       next_state,
+        "EVENT_TS":         now.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z",
+        "DWELL_TIME_SEC":   None,
+        "SEARCH_QUERY":     None,
+        "REFERRER_ITEM_ID": None,
+        "PROPERTIES":       json.dumps({
+            "device":  user["device_type"],
+            "country": user["country"],
         }),
     }
 
     if next_state == "search":
-        event["search_query"] = random.choice(SEARCH_QUERIES)
-        # Bias future items toward a matching category
-        query = event["search_query"].lower()
+        event["SEARCH_QUERY"] = random.choice(SEARCH_QUERIES)
+        query = event["SEARCH_QUERY"].lower()
         for cat in items_by_cat:
             if cat.lower() in query or any(w in query for w in cat.lower().split()):
                 session.category_bias = cat
@@ -290,87 +276,62 @@ def generate_event(
 
     elif next_state in ("view", "click", "add_to_cart", "purchase"):
         item_id = trending.pick_item(session.category_bias, items_by_cat)
-        event["item_id"] = item_id
+        event["ITEM_ID"] = item_id
         session.last_item_id = item_id
 
-        # Infer category from item and set bias
         for cat, cat_items in items_by_cat.items():
             if item_id in cat_items:
                 session.category_bias = cat
                 break
 
         if next_state == "view":
-            event["dwell_time_sec"] = _rand_dwell()
+            event["DWELL_TIME_SEC"] = _rand_dwell()
         if next_state == "click" and session.last_item_id:
-            event["referrer_item_id"] = session.last_item_id
+            event["REFERRER_ITEM_ID"] = session.last_item_id
 
     return event
 
 
 # ---------------------------------------------------------------------------
-# Snowflake I/O
+# Ingest API
 # ---------------------------------------------------------------------------
 
-INSERT_EVENTS_SQL = """
-INSERT INTO RAW_EVENTS (
-    event_id, session_id, user_id, item_id, event_type, event_ts,
-    dwell_time_sec, search_query, referrer_item_id, properties
-) VALUES (
-    %(event_id)s, %(session_id)s, %(user_id)s, %(item_id)s, %(event_type)s,
-    %(event_ts)s::TIMESTAMP_NTZ, %(dwell_time_sec)s, %(search_query)s,
-    %(referrer_item_id)s, PARSE_JSON(%(properties)s)
-)
-"""
+def ingest_events(
+    events: list[dict],
+    ingest_url: str = None,
+    pat: str = None,
+    dry_run: bool = False,
+) -> dict:
+    """POST a batch of events to the online service ingest API.
 
-INSERT_USERS_SQL = """
-INSERT INTO USERS (user_id, signup_ts, country, user_segment, device_type, age_group)
-VALUES (%(user_id)s, %(signup_ts)s::TIMESTAMP_NTZ, %(country)s,
-        %(user_segment)s, %(device_type)s, %(age_group)s)
-"""
+    Args:
+        events: List of event dicts (uppercase field names expected by the API).
+        ingest_url: Base URL of the online service. Defaults to INGEST_URL config.
+        pat: Snowflake PAT. Defaults to SNOWFLAKE_PAT config.
+        dry_run: If True, validates the payload without writing data.
 
-INSERT_ITEMS_SQL = """
-INSERT INTO ITEMS (item_id, category, subcategory, brand, price,
-                   avg_rating, is_available, created_at)
-VALUES (%(item_id)s, %(category)s, %(subcategory)s, %(brand)s, %(price)s,
-        %(avg_rating)s, %(is_available)s, %(created_at)s::TIMESTAMP_NTZ)
-"""
+    Returns:
+        Parsed JSON response from the ingest API.
+    """
+    url = ingest_url or INGEST_URL
+    token = pat or SNOWFLAKE_PAT
 
-
-def seed_catalog(cur) -> tuple[list[dict], list[dict]]:
-    """Insert users and items if not already seeded."""
-    cur.execute("SELECT COUNT(*) FROM USERS")
-    user_count = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM ITEMS")
-    item_count = cur.fetchone()[0]
-
-    users = generate_users()
-    items = generate_items()
-
-    if user_count == 0:
-        log.info(f"Seeding {len(users)} users...")
-        cur.executemany(INSERT_USERS_SQL, users)
-        log.info("  Users seeded.")
-    else:
-        log.info(f"Users already seeded ({user_count} rows). Loading from DB...")
-        cur.execute("SELECT user_id, device_type, country FROM USERS")
-        rows = cur.fetchall()
-        users = [{"user_id": r[0], "device_type": r[1], "country": r[2]} for r in rows]
-
-    if item_count == 0:
-        log.info(f"Seeding {len(items)} items...")
-        cur.executemany(INSERT_ITEMS_SQL, items)
-        log.info("  Items seeded.")
-    else:
-        log.info(f"Items already seeded ({item_count} rows). Loading from DB...")
-        cur.execute("SELECT item_id, category FROM ITEMS")
-        rows = cur.fetchall()
-        items = [{"item_id": r[0], "category": r[1]} for r in rows]
-
-    return users, items
-
-
-def insert_events(cur, events: list[dict]):
-    cur.executemany(INSERT_EVENTS_SQL, events)
+    response = requests.post(
+        f"{url}/api/v1/ingest",
+        headers={
+            "Authorization": f'Snowflake Token="{token}"',
+            "Content-Type": "application/json",
+        },
+        json={
+            "dry_run": dry_run,
+            "include_diagnostics": True,
+            "records": {
+                "raw_events": events,
+            },
+        },
+    )
+    response.raise_for_status()
+    return response.json()
 
 
 # ---------------------------------------------------------------------------
@@ -378,12 +339,9 @@ def insert_events(cur, events: list[dict]):
 # ---------------------------------------------------------------------------
 
 def main():
-    log.info("Connecting to Snowflake...")
-    conn = snowflake.connector.connect(**{k: v for k, v in CONNECTION.items() if v})
-    cur  = conn.cursor()
-
-    log.info("Seeding catalog...")
-    users, items = seed_catalog(cur)
+    log.info("Generating in-memory catalog...")
+    users = generate_users()
+    items = generate_items()
 
     # Build lookup structures
     user_ids = [u["user_id"] for u in users]
@@ -402,6 +360,7 @@ def main():
     loop_count     = 0
 
     log.info(f"Starting event stream. Target: {ACTIVE_SESSION_TARGET} concurrent sessions.")
+    log.info(f"Ingest URL: {INGEST_URL}")
     log.info("Press Ctrl+C to stop.\n")
 
     try:
@@ -424,32 +383,30 @@ def main():
             # Remove finished sessions
             sessions = [s for s in sessions if not s.is_done()]
 
-            # Insert batch
+            # Send batch via ingest API
             if batch:
-                insert_events(cur, batch)
+                result = ingest_events(batch)
                 total_inserted += len(batch)
+                if result.get("diagnostics"):
+                    log.debug(f"Ingest diagnostics: {result['diagnostics']}")
 
             # Stats every 10 loops
             if loop_count % 10 == 0:
-                elapsed   = time.time() - run_start
-                rate      = total_inserted / elapsed if elapsed > 0 else 0
-                trending_items = list(trending.trending.keys())
+                elapsed = time.time() - run_start
+                rate    = total_inserted / elapsed if elapsed > 0 else 0
                 log.info(
                     f"Events: {total_inserted:,}  |  "
                     f"Rate: {rate:.1f}/s  |  "
                     f"Active sessions: {len(sessions)}  |  "
-                    f"Trending: {trending_items or 'none'}"
+                    f"Trending: {list(trending.trending.keys()) or 'none'}"
                 )
 
             time.sleep(BATCH_INTERVAL_SEC)
 
     except KeyboardInterrupt:
         elapsed = time.time() - run_start
-        log.info(f"\nStopped. Inserted {total_inserted:,} events in {elapsed:.0f}s "
+        log.info(f"\nStopped. Sent {total_inserted:,} events in {elapsed:.0f}s "
                  f"({total_inserted/elapsed:.1f} events/sec)")
-    finally:
-        cur.close()
-        conn.close()
 
 
 if __name__ == "__main__":
