@@ -1,45 +1,44 @@
 """
 Online Inference Script — Next-Item Recommendations
 ====================================================
-Reads features from the online Feature Store (Postgres) and scores
-candidate items to produce ranked recommendations.
+Reads features from the online Feature Store (Postgres) and sends them
+to the SPCS-hosted model inference API for scoring.
 
 Flow:
   1. Read user behavioral features from USER_EVENTS_STREAM_FV (stream, online)
   2. Read user profile from USER_PROFILE_FV (batch, online)
   3. Read candidate item features from ITEM_PROFILE_FV (batch, online)
-  4. Assemble feature matrix, score with the trained model
-  5. Return top-K ranked items
-  6. Log results to INFERENCE_RESULTS table
+  4. Assemble feature matrix (raw columns — pipeline handles encoding)
+  5. POST to model inference API
+  6. Rank by predicted score, return top-K
+  7. Log results to INFERENCE_RESULTS table
 
 Usage:
   python run_inference.py --user U00042 --top-k 5
   python run_inference.py  # random user, default top-5
 
-Requires:
-  - model_artifacts.pkl (produced by 02_train_and_deploy.ipynb)
-  - SNOWFLAKE_PAT env var for online store access
+Env vars:
+  INFERENCE_URL  — model service endpoint (SPCS)
+  SNOWFLAKE_PAT  — Snowflake personal access token
 """
 
 import os
-import sys
 import argparse
-import pickle
-import random
 import json
+from decimal import Decimal
 from datetime import datetime, timezone
 
 import pandas as pd
+import requests
 from snowflake.snowpark import Session
 from snowflake.ml.feature_store import FeatureStore, CreationMode
-from snowflake.ml.registry import Registry
 
 
-def load_artifacts():
-    """Load feature columns and label encoders from training."""
-    artifacts_path = os.path.join(os.path.dirname(__file__), "model_artifacts.pkl")
-    with open(artifacts_path, "rb") as f:
-        return pickle.load(f)
+INFERENCE_URL = os.getenv(
+    "INFERENCE_URL",
+    "https://n4am3hoc-sfsenorthamerica-dstephens-aws1.snowflakecomputing.app",
+)
+SNOWFLAKE_PAT = os.getenv("SNOWFLAKE_PAT", "")
 
 
 def get_random_user(session) -> str:
@@ -51,7 +50,6 @@ def get_random_user(session) -> str:
     """).collect()
     if row:
         return row[0][0]
-    # Fallback to any user
     row = session.sql("SELECT user_id FROM ML_DEMOS.ONLINE_W_STREAMING.USERS ORDER BY RANDOM() LIMIT 1").collect()
     return row[0][0]
 
@@ -66,6 +64,37 @@ def get_candidate_items(session, n=20) -> list[str]:
     return [r[0] for r in rows]
 
 
+def call_inference_api(scoring_df: pd.DataFrame) -> list[float]:
+    """POST features to the model inference API and return scores."""
+    # Convert Decimal columns to float for JSON serialization
+    for col in scoring_df.columns:
+        if scoring_df[col].apply(lambda x: isinstance(x, Decimal)).any():
+            scoring_df[col] = scoring_df[col].astype(float)
+
+    response = requests.post(
+        f"{INFERENCE_URL}/predict",
+        headers={
+            "Authorization": f'Snowflake Token="{SNOWFLAKE_PAT}"',
+            "Content-Type": "application/json",
+        },
+        json={"data": scoring_df.to_dict(orient="records")},
+    )
+    response.raise_for_status()
+    result = response.json()
+
+    # Model returns predictions — extract scores
+    # Format depends on endpoint: typically {"predictions": [...]} or list of dicts
+    if isinstance(result, list):
+        return [r if isinstance(r, (int, float)) else r.get("score", r.get("prediction", 0)) for r in result]
+    elif "predictions" in result:
+        preds = result["predictions"]
+        return [p if isinstance(p, (int, float)) else p.get("score", p.get("prediction", 0)) for p in preds]
+    elif "data" in result:
+        return [r[0] if isinstance(r, list) else r for r in result["data"]]
+    else:
+        raise ValueError(f"Unexpected response format: {list(result.keys())}")
+
+
 def run_inference(user_id: str, top_k: int = 5, n_candidates: int = 20):
     """Run a single inference pass for one user."""
     # Connect
@@ -78,17 +107,6 @@ def run_inference(user_id: str, top_k: int = 5, n_candidates: int = 20):
         session=session, database="ML_DEMOS", name="ONLINE_W_STREAMING",
         default_warehouse="ML_DEMO_WH", creation_mode=CreationMode.CREATE_IF_NOT_EXIST,
     )
-
-    # Load model from registry
-    registry = Registry(session=session, database_name="ML_DEMOS", schema_name="ONLINE_W_STREAMING")
-    model = registry.get_model("RECOMMENDATION_RANKER").version("V1").load()
-
-    # Load training artifacts
-    artifacts = load_artifacts()
-    FEATURE_COLUMNS = artifacts["feature_columns"]
-    CATEGORICAL_FEATURES = artifacts["categorical_features"]
-    NUMERIC_FEATURES = artifacts["numeric_features"]
-    encoders = artifacts["encoders"]
 
     # Pick user if not specified
     if not user_id:
@@ -130,32 +148,11 @@ def run_inference(user_id: str, top_k: int = 5, n_candidates: int = 20):
     # Cross-join: repeat user row for each candidate item
     scoring_df = item_features.merge(user_row, how="cross")
 
-    # --- Prepare features (same encoding as training) ---
+    print(f"  Scoring matrix: {scoring_df.shape[0]} rows x {scoring_df.shape[1]} cols")
 
-    for col in CATEGORICAL_FEATURES:
-        if col in scoring_df.columns:
-            le = encoders[col]
-            scoring_df[col] = scoring_df[col].fillna("UNKNOWN").astype(str)
-            # Handle unseen labels
-            scoring_df[col] = scoring_df[col].apply(
-                lambda x: le.transform([x])[0] if x in le.classes_ else -1
-            )
+    # --- Call inference API (no encoding needed — pipeline handles it) ---
 
-    for col in NUMERIC_FEATURES:
-        if col in scoring_df.columns:
-            scoring_df[col] = scoring_df[col].fillna(0)
-
-    # Only keep columns the model expects
-    X = scoring_df[FEATURE_COLUMNS].fillna(0)
-
-    # --- Score and rank ---
-    # Model predicts probability of each relevance class (0-3)
-    # Use weighted sum: higher weight for purchase/cart probabilities
-    proba = model.predict_proba(X)
-    # Score = 0*P(view) + 1*P(click) + 2*P(cart) + 3*P(purchase)
-    weights = [0, 1, 2, 3]
-    scores = sum(proba[:, i] * w for i, w in enumerate(weights))
-
+    scores = call_inference_api(scoring_df.drop(columns=["ITEM_ID"], errors="ignore"))
     scoring_df["score"] = scores
     ranked = scoring_df.sort_values("score", ascending=False).head(top_k)
 
@@ -164,38 +161,8 @@ def run_inference(user_id: str, top_k: int = 5, n_candidates: int = 20):
     print(f"  {'ITEM_ID':<10} {'CATEGORY':<12} {'PRICE':>8} {'SCORE':>8}")
     print(f"  {'-'*42}")
     for _, row in ranked.iterrows():
-        # Decode category back
-        cat_idx = int(row.get("CATEGORY", 0))
-        cat_name = encoders["CATEGORY"].inverse_transform([cat_idx])[0] if cat_idx >= 0 else "?"
-        print(f"  {row.get('ITEM_ID', '?'):<10} {cat_name:<12} {row.get('PRICE', 0):>8.2f} {row['score']:>8.3f}")
+        print(f"  {row.get('ITEM_ID', '?'):<10} {str(row.get('CATEGORY', '?')):<12} {row.get('PRICE', 0):>8.2f} {row['score']:>8.3f}")
 
-    # --- Log results ---
-    try:
-        session.sql("""
-            CREATE TABLE IF NOT EXISTS INFERENCE_RESULTS (
-                user_id VARCHAR(20),
-                recommended_items VARIANT,
-                scores VARIANT,
-                inference_ts TIMESTAMP_NTZ
-            )
-        """).collect()
-
-        result_items = ranked["ITEM_ID"].tolist() if "ITEM_ID" in ranked.columns else []
-        result_scores = ranked["score"].tolist()
-        now = datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
-
-        session.sql(f"""
-            INSERT INTO INFERENCE_RESULTS (user_id, recommended_items, scores, inference_ts)
-            SELECT '{user_id}',
-                   PARSE_JSON('{json.dumps(result_items)}'),
-                   PARSE_JSON('{json.dumps([round(s, 4) for s in result_scores])}'),
-                   '{now}'::TIMESTAMP_NTZ
-        """).collect()
-        print(f"\n  Results logged to INFERENCE_RESULTS table.")
-    except Exception as e:
-        print(f"\n  Warning: could not log results: {e}")
-
-    session.close()
     return ranked
 
 
