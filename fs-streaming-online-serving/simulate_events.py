@@ -34,12 +34,15 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-INGEST_URL   = os.getenv("INGEST_URL", "http://fs-runtime-164092676.f6yc.svc.spcs.internal:8080")
+INGEST_URL   = os.getenv("INGEST_URL", "")
 SNOWFLAKE_PAT = os.getenv("SNOWFLAKE_PAT", "")
 
 BATCH_INTERVAL_SEC    = 1.5    # seconds between inserts
@@ -316,6 +319,19 @@ def ingest_events(
     url = ingest_url or INGEST_URL
     token = pat or SNOWFLAKE_PAT
 
+    # API rejects null for typed fields — convert None to type-appropriate defaults
+    STRING_FIELDS = {"EVENT_ID", "SESSION_ID", "USER_ID", "ITEM_ID", "EVENT_TYPE",
+                     "SEARCH_QUERY", "REFERRER_ITEM_ID", "PROPERTIES"}
+    clean_events = []
+    for event in events:
+        clean = {}
+        for k, v in event.items():
+            if v is None:
+                clean[k] = "" if k in STRING_FIELDS else 0
+            else:
+                clean[k] = v
+        clean_events.append(clean)
+
     response = requests.post(
         f"{url}/api/v1/ingest",
         headers={
@@ -326,7 +342,7 @@ def ingest_events(
             "dry_run": dry_run,
             "include_diagnostics": True,
             "records": {
-                "raw_events": events,
+                "raw_events": clean_events,
             },
         },
     )
@@ -383,12 +399,14 @@ def main():
             # Remove finished sessions
             sessions = [s for s in sessions if not s.is_done()]
 
-            # Send batch via ingest API
+            # Send batch via ingest API (max 10 records per request)
             if batch:
-                result = ingest_events(batch)
+                for i in range(0, len(batch), 10):
+                    chunk = batch[i:i+10]
+                    result = ingest_events(chunk)
+                    if result.get("diagnostics"):
+                        log.debug(f"Ingest diagnostics: {result['diagnostics']}")
                 total_inserted += len(batch)
-                if result.get("diagnostics"):
-                    log.debug(f"Ingest diagnostics: {result['diagnostics']}")
 
             # Stats every 10 loops
             if loop_count % 10 == 0:

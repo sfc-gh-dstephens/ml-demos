@@ -1,3 +1,4 @@
 .snowflake/
 .venv/
 .env
+__pycache__/

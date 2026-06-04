@@ -28,16 +28,15 @@ import json
 from decimal import Decimal
 from datetime import datetime, timezone
 
+from dotenv import load_dotenv
 import pandas as pd
 import requests
 from snowflake.snowpark import Session
 from snowflake.ml.feature_store import FeatureStore, CreationMode
 
+load_dotenv()
 
-INFERENCE_URL = os.getenv(
-    "INFERENCE_URL",
-    "https://n4am3hoc-sfsenorthamerica-dstephens-aws1.snowflakecomputing.app",
-)
+INFERENCE_URL = os.getenv("INFERENCE_URL", "")
 SNOWFLAKE_PAT = os.getenv("SNOWFLAKE_PAT", "")
 
 
@@ -71,28 +70,46 @@ def call_inference_api(scoring_df: pd.DataFrame) -> list[float]:
         if scoring_df[col].apply(lambda x: isinstance(x, Decimal)).any():
             scoring_df[col] = scoring_df[col].astype(float)
 
+    # Fill NaN with appropriate defaults
+    scoring_df = scoring_df.fillna(0)
+
+    # Reorder columns to match model signature exactly
+    model_col_order = [
+        "PRICE", "AVG_RATING",
+        "VIEW_COUNT_1H", "VIEW_COUNT_24H", "CART_COUNT_1H",
+        "PURCHASE_COUNT_24H", "TOTAL_DWELL_SEC_1H", "UNIQUE_ITEMS_VIEWED_1H",
+        "COUNTRY", "USER_SEGMENT", "DEVICE_TYPE", "AGE_GROUP",
+        "CATEGORY", "SUBCATEGORY", "BRAND",
+    ]
+    scoring_df = scoring_df[model_col_order]
+
+    # SPCS inference format: each row is [row_index, col1, col2, ...]
+    rows = []
+    for idx, (_, row) in enumerate(scoring_df.iterrows()):
+        rows.append([idx] + row.tolist())
+    payload = {"data": rows}
+
     response = requests.post(
         f"{INFERENCE_URL}/predict",
         headers={
             "Authorization": f'Snowflake Token="{SNOWFLAKE_PAT}"',
             "Content-Type": "application/json",
+            "sf-custom-input-columns": ",".join(model_col_order),
         },
-        json={"data": scoring_df.to_dict(orient="records")},
+        json=payload,
     )
     response.raise_for_status()
     result = response.json()
 
-    # Model returns predictions — extract scores
-    # Format depends on endpoint: typically {"predictions": [...]} or list of dicts
-    if isinstance(result, list):
-        return [r if isinstance(r, (int, float)) else r.get("score", r.get("prediction", 0)) for r in result]
-    elif "predictions" in result:
-        preds = result["predictions"]
-        return [p if isinstance(p, (int, float)) else p.get("score", p.get("prediction", 0)) for p in preds]
-    elif "data" in result:
-        return [r[0] if isinstance(r, list) else r for r in result["data"]]
-    else:
-        raise ValueError(f"Unexpected response format: {list(result.keys())}")
+    # Response format: {"data": [[row_idx, {"output_feature_0": predicted_class}], ...]}
+    scores = []
+    for row in result["data"]:
+        prediction = row[1]  # second element is the prediction dict
+        if isinstance(prediction, dict):
+            scores.append(float(prediction.get("output_feature_0", prediction.get("predict", 0))))
+        else:
+            scores.append(float(prediction))
+    return scores
 
 
 def run_inference(user_id: str, top_k: int = 5, n_candidates: int = 20):
@@ -116,9 +133,12 @@ def run_inference(user_id: str, top_k: int = 5, n_candidates: int = 20):
     # --- Read features from the online store ---
 
     # 1. Stream FV: real-time behavioral aggregations
+    # Stream FV has entities [USER, ITEM] — query with user + first candidate item
+    # (aggregations are user-level, item key is required but doesn't filter results)
     stream_fv = fs.get_feature_view("USER_EVENTS_STREAM_FV", "V1")
+    candidate_items = get_candidate_items(session, n_candidates)
     user_stream_features = fs.read_feature_view(
-        stream_fv, keys=[[user_id]], store_type="online"
+        stream_fv, keys=[[user_id, candidate_items[0]]], store_type="online"
     )
     print(f"  Stream features: {user_stream_features.columns.tolist()}")
 
@@ -130,7 +150,6 @@ def run_inference(user_id: str, top_k: int = 5, n_candidates: int = 20):
     print(f"  Profile features: {user_profile_features.columns.tolist()}")
 
     # 3. Batch FV: candidate item features
-    candidate_items = get_candidate_items(session, n_candidates)
     item_fv = fs.get_feature_view("ITEM_PROFILE_FV", "V1")
     item_features = fs.read_feature_view(
         item_fv, keys=[[item_id] for item_id in candidate_items], store_type="online"
@@ -142,7 +161,7 @@ def run_inference(user_id: str, top_k: int = 5, n_candidates: int = 20):
     # Merge user features into a single row
     user_row = pd.concat([
         user_profile_features.drop(columns=["USER_ID"], errors="ignore"),
-        user_stream_features.drop(columns=["USER_ID"], errors="ignore"),
+        user_stream_features.drop(columns=["USER_ID", "ITEM_ID"], errors="ignore"),
     ], axis=1)
 
     # Cross-join: repeat user row for each candidate item
@@ -151,8 +170,10 @@ def run_inference(user_id: str, top_k: int = 5, n_candidates: int = 20):
     print(f"  Scoring matrix: {scoring_df.shape[0]} rows x {scoring_df.shape[1]} cols")
 
     # --- Call inference API (no encoding needed — pipeline handles it) ---
+    # Drop entity keys — the model only sees feature columns from the FVs
+    feature_df = scoring_df.drop(columns=["ITEM_ID", "USER_ID"], errors="ignore")
 
-    scores = call_inference_api(scoring_df.drop(columns=["ITEM_ID"], errors="ignore"))
+    scores = call_inference_api(feature_df)
     scoring_df["score"] = scores
     ranked = scoring_df.sort_values("score", ascending=False).head(top_k)
 
